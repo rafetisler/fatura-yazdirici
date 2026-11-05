@@ -6,7 +6,7 @@ from typing import List
 
 import pymupdf as fitz  # PyMuPDF
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QImage, QPixmap
+from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QImage, QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -403,8 +403,34 @@ class MainWindow(QMainWindow):
     def _apply_global_styles(self):
         self.setStyleSheet(
             """
-            QMainWindow {
+            QMainWindow, QDialog, QMessageBox {
                 background-color: #F8FAFC;
+                color: #0F172A;
+            }
+            QMessageBox QLabel {
+                color: #0F172A;
+                font-size: 13px;
+                font-weight: 500;
+                background-color: transparent;
+            }
+            QMessageBox QPushButton {
+                min-width: 80px;
+                padding: 6px 16px;
+                background-color: #2563EB;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                font-weight: 700;
+            }
+            QMessageBox QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+            QToolTip {
+                background-color: #FFFFFF;
+                color: #0F172A;
+                border: 1px solid #CBD5E1;
+                padding: 6px;
+                font-size: 12px;
             }
             QLabel {
                 color: #1E293B;
@@ -1573,6 +1599,24 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # Force a clean Light Palette so Windows Dark Mode never causes unreadable dark-on-dark popups or dropdowns
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#F8FAFC"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#0F172A"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#F1F5F9"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#0F172A"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#0F172A"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#0F172A"))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor("#DC2626"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#2563EB"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    app.setPalette(palette)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
