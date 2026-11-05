@@ -44,13 +44,18 @@ from printer_service import (
 )
 
 
-def _get_app_dir() -> Path:
+def _get_settings_file() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            cfg_dir = Path(local_appdata) / "FaturaYazdirici"
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            return cfg_dir / "settings.json"
+        return Path(sys.executable).parent / "settings.json"
+    return Path(__file__).parent / "settings.json"
 
 
-CONFIG_FILE = _get_app_dir() / "settings.json"
+CONFIG_FILE = _get_settings_file()
 
 
 class PrintWorker(QThread):
