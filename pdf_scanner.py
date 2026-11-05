@@ -189,6 +189,57 @@ def analyze_pdf_pages(doc: fitz.Document) -> tuple[bool, int, str, str]:
     return False, page_count, reason, page2_preview
 
 
+def analyze_single_pdf_file(
+    pdf_path: str | Path,
+    base_folder: Path | None = None,
+    default_copies: int = 1,
+    smart_skip_redundant_pages: bool = True,
+) -> PdfInvoiceItem:
+    """Analyzes a single PDF file and returns a PdfInvoiceItem."""
+    pdf_p = Path(pdf_path)
+    try:
+        if base_folder and pdf_p.parent != base_folder and pdf_p.is_relative_to(base_folder):
+            rel_name = str(pdf_p.relative_to(base_folder))
+        else:
+            rel_name = pdf_p.name
+    except Exception:
+        rel_name = pdf_p.name
+
+    try:
+        with fitz.open(pdf_p) as doc:
+            page_count = len(doc)
+            is_redundant, rec_pages, reason, p2_preview = analyze_pdf_pages(doc)
+
+        printable_pages = (
+            rec_pages if (smart_skip_redundant_pages and is_redundant) else page_count
+        )
+
+        return PdfInvoiceItem(
+            file_path=pdf_p,
+            file_name=rel_name,
+            page_count=page_count,
+            printable_pages=printable_pages,
+            copies=default_copies,
+            selected=True,
+            status="Bekliyor",
+            page2_is_redundant=is_redundant,
+            page2_reason=reason,
+            page2_preview=p2_preview,
+            force_print_all=not (smart_skip_redundant_pages and is_redundant),
+        )
+    except Exception as exc:
+        return PdfInvoiceItem(
+            file_path=pdf_p,
+            file_name=rel_name,
+            page_count=0,
+            printable_pages=0,
+            copies=default_copies,
+            selected=False,
+            status="Okuma Hatası",
+            error_message=str(exc),
+        )
+
+
 def scan_folder_for_pdfs(
     folder_path: str | Path,
     default_copies: int = 1,
@@ -200,12 +251,10 @@ def scan_folder_for_pdfs(
     if not folder.exists() or not folder.is_dir():
         return []
 
-    items: List[PdfInvoiceItem] = []
     raw_files: List[Path] = []
 
     if include_subfolders:
         for p in folder.rglob("*"):
-            # Skip already printed archive folders
             if "yazdırılanlar" in [part.lower() for part in p.parts]:
                 continue
             if p.is_file() and p.suffix.lower() == ".pdf":
@@ -217,50 +266,12 @@ def scan_folder_for_pdfs(
 
     pdf_files = sorted(raw_files, key=lambda x: str(x).lower())
 
-    for pdf_path in pdf_files:
-        try:
-            rel_name = (
-                str(pdf_path.relative_to(folder))
-                if pdf_path.parent != folder
-                else pdf_path.name
-            )
-        except Exception:
-            rel_name = pdf_path.name
-
-        try:
-            with fitz.open(pdf_path) as doc:
-                page_count = len(doc)
-                is_redundant, rec_pages, reason, p2_preview = analyze_pdf_pages(doc)
-
-            printable_pages = rec_pages if (smart_skip_redundant_pages and is_redundant) else page_count
-
-            items.append(
-                PdfInvoiceItem(
-                    file_path=pdf_path,
-                    file_name=rel_name,
-                    page_count=page_count,
-                    printable_pages=printable_pages,
-                    copies=default_copies,
-                    selected=True,
-                    status="Bekliyor",
-                    page2_is_redundant=is_redundant,
-                    page2_reason=reason,
-                    page2_preview=p2_preview,
-                    force_print_all=not (smart_skip_redundant_pages and is_redundant),
-                )
-            )
-        except Exception as exc:
-            items.append(
-                PdfInvoiceItem(
-                    file_path=pdf_path,
-                    file_name=rel_name,
-                    page_count=0,
-                    printable_pages=0,
-                    copies=default_copies,
-                    selected=False,
-                    status="Okuma Hatası",
-                    error_message=str(exc),
-                )
-            )
-
-    return items
+    return [
+        analyze_single_pdf_file(
+            pdf_path=p,
+            base_folder=folder,
+            default_copies=default_copies,
+            smart_skip_redundant_pages=smart_skip_redundant_pages,
+        )
+        for p in pdf_files
+    ]

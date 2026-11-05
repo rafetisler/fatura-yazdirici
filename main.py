@@ -4,8 +4,9 @@ import sys
 from pathlib import Path
 from typing import List
 
+import pymupdf as fitz  # PyMuPDF
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -21,14 +22,20 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from pdf_scanner import PdfInvoiceItem, scan_folder_for_pdfs
+from pdf_scanner import (
+    PdfInvoiceItem,
+    analyze_single_pdf_file,
+    scan_folder_for_pdfs,
+)
 from printer_service import (
     check_printer_status,
     get_installed_printers,
@@ -105,10 +112,11 @@ class PrintWorker(QThread):
                 )
 
                 if self.auto_move:
-                    move_to_printed_folder(
+                    moved_dest = move_to_printed_folder(
                         pdf_path=item.file_path,
                         use_date_subfolder=self.use_date_subfolder,
                     )
+                    item.file_path = moved_dest
                     self.item_status_updated.emit(
                         row_index, "Basıldı & Taşındı", ""
                     )
@@ -159,6 +167,203 @@ class StatCard(QFrame):
         self.value_lbl.setText(value)
 
 
+class PdfPreviewPanel(QFrame):
+    """Built-in fast PDF page viewer with page navigation, zoom, and page-2 status banner."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("PreviewPanel")
+        self.setStyleSheet(
+            """
+            QFrame#PreviewPanel {
+                background-color: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+            """
+        )
+        self.current_item: PdfInvoiceItem | None = None
+        self.current_page_idx: int = 0
+        self.zoom_factor: float = 1.15
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # Header row: Title + Open Externally button
+        header_row = QHBoxLayout()
+        self.lbl_title = QLabel("👁️ Hızlı Fatura Önizleme")
+        self.lbl_title.setStyleSheet(
+            "font-weight: 700; font-size: 13px; color: #0F172A; border: none;"
+        )
+        self.btn_open_ext = QPushButton("↗ Dışarıda Aç")
+        self.btn_open_ext.setToolTip("Varsayılan PDF okuyucuda tam ekran aç")
+        self.btn_open_ext.clicked.connect(self.open_externally)
+        self.btn_open_ext.setEnabled(False)
+
+        header_row.addWidget(self.lbl_title, stretch=1)
+        header_row.addWidget(self.btn_open_ext)
+        layout.addLayout(header_row)
+
+        # Smart analysis banner
+        self.lbl_banner = QLabel("Tablodan bir faturaya tıklayarak içeriğini burada görebilirsiniz.")
+        self.lbl_banner.setWordWrap(True)
+        self.lbl_banner.setStyleSheet(
+            "background-color: #F1F5F9; color: #475569; font-size: 12px; font-weight: 600; padding: 6px 8px; border-radius: 6px;"
+        )
+        layout.addWidget(self.lbl_banner)
+
+        # Scroll area for rendered PDF page image
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll_area.setStyleSheet(
+            "QScrollArea { background-color: #E2E8F0; border: 1px solid #CBD5E1; border-radius: 6px; }"
+        )
+
+        self.lbl_image = QLabel("📄\n\nÖnizleme için listeden bir fatura seçin\nveya PDF dosyalarını buraya sürükleyip bırakın")
+        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_image.setStyleSheet("color: #64748B; font-size: 13px; font-weight: 600; padding: 24px;")
+        self.scroll_area.setWidget(self.lbl_image)
+        layout.addWidget(self.scroll_area, stretch=1)
+
+        # Footer navigation & zoom controls
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
+
+        self.btn_prev = QPushButton("◀ Önceki")
+        self.btn_prev.clicked.connect(self.prev_page)
+        self.btn_prev.setEnabled(False)
+
+        self.lbl_page_info = QLabel("Sayfa: - / -")
+        self.lbl_page_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_page_info.setStyleSheet("font-weight: 700; font-size: 12px; color: #1E293B;")
+
+        self.btn_next = QPushButton("Sonraki ▶")
+        self.btn_next.clicked.connect(self.next_page)
+        self.btn_next.setEnabled(False)
+
+        self.btn_zoom_out = QPushButton("🔍-")
+        self.btn_zoom_out.setToolTip("Küçült")
+        self.btn_zoom_out.setFixedWidth(44)
+        self.btn_zoom_out.clicked.connect(self.zoom_out)
+
+        self.btn_zoom_in = QPushButton("🔍+")
+        self.btn_zoom_in.setToolTip("Büyüt")
+        self.btn_zoom_in.setFixedWidth(44)
+        self.btn_zoom_in.clicked.connect(self.zoom_in)
+
+        nav_row.addWidget(self.btn_prev)
+        nav_row.addWidget(self.lbl_page_info, stretch=1)
+        nav_row.addWidget(self.btn_next)
+        nav_row.addWidget(self.btn_zoom_out)
+        nav_row.addWidget(self.btn_zoom_in)
+
+        layout.addLayout(nav_row)
+
+    def clear_preview(self):
+        self.current_item = None
+        self.current_page_idx = 0
+        self.lbl_title.setText("👁️ Hızlı Fatura Önizleme")
+        self.lbl_banner.setText("Tablodan bir faturaya tıklayarak içeriğini burada görebilirsiniz.")
+        self.lbl_banner.setStyleSheet(
+            "background-color: #F1F5F9; color: #475569; font-size: 12px; font-weight: 600; padding: 6px 8px; border-radius: 6px;"
+        )
+        self.lbl_image.setPixmap(QPixmap())
+        self.lbl_image.setText(
+            "📄\n\nÖnizleme için listeden bir fatura seçin\nveya PDF dosyalarını buraya sürükleyip bırakın"
+        )
+        self.lbl_page_info.setText("Sayfa: - / -")
+        self.btn_prev.setEnabled(False)
+        self.btn_next.setEnabled(False)
+        self.btn_open_ext.setEnabled(False)
+
+    def load_invoice_item(self, item: PdfInvoiceItem):
+        self.current_item = item
+        self.current_page_idx = 0
+        self.btn_open_ext.setEnabled(item.file_path.exists())
+        self.lbl_title.setText(f"👁️ {item.file_name}")
+        self._render_current_page()
+
+    def prev_page(self):
+        if self.current_item and self.current_page_idx > 0:
+            self.current_page_idx -= 1
+            self._render_current_page()
+
+    def next_page(self):
+        if self.current_item and self.current_page_idx + 1 < self.current_item.page_count:
+            self.current_page_idx += 1
+            self._render_current_page()
+
+    def zoom_in(self):
+        self.zoom_factor = min(2.5, self.zoom_factor + 0.2)
+        self._render_current_page()
+
+    def zoom_out(self):
+        self.zoom_factor = max(0.6, self.zoom_factor - 0.2)
+        self._render_current_page()
+
+    def open_externally(self):
+        if self.current_item and self.current_item.file_path.exists():
+            os.startfile(str(self.current_item.file_path))
+
+    def _render_current_page(self):
+        item = self.current_item
+        if not item or not item.file_path.exists() or item.page_count <= 0:
+            self.lbl_image.setPixmap(QPixmap())
+            self.lbl_image.setText("Dosya bulunamadı veya okunamadı.")
+            return
+
+        total = item.page_count
+        page_num = self.current_page_idx + 1
+        self.lbl_page_info.setText(f"Sayfa: {page_num} / {total}")
+        self.btn_prev.setEnabled(self.current_page_idx > 0)
+        self.btn_next.setEnabled(self.current_page_idx + 1 < total)
+
+        # Update top banner according to whether this specific page will be printed or skipped
+        will_be_printed = page_num <= item.effective_pages_to_print
+        if total == 1:
+            self.lbl_banner.setText("✅ Tek sayfalık fatura (Bu sayfa yazdırılacak)")
+            self.lbl_banner.setStyleSheet(
+                "background-color: #DCFCE7; color: #15803D; font-size: 12px; font-weight: 700; padding: 6px 8px; border-radius: 6px;"
+            )
+        elif will_be_printed:
+            self.lbl_banner.setText(
+                f"✅ Sayfa {page_num}/{total} (Yazdırılacak) — {item.page2_reason}"
+            )
+            self.lbl_banner.setStyleSheet(
+                "background-color: #DCFCE7; color: #15803D; font-size: 12px; font-weight: 700; padding: 6px 8px; border-radius: 6px;"
+            )
+        else:
+            self.lbl_banner.setText(
+                f"✂️ Sayfa {page_num}/{total} (ATLANACAK - BASILMAYACAK)\nSebep: {item.page2_reason}"
+            )
+            self.lbl_banner.setStyleSheet(
+                "background-color: #FEF3C7; color: #B45309; font-size: 12px; font-weight: 700; padding: 6px 8px; border-radius: 6px; border: 1px solid #F59E0B;"
+            )
+
+        try:
+            with fitz.open(item.file_path) as doc:
+                page = doc[self.current_page_idx]
+                # Calculate fit width based on viewport width and zoom factor
+                viewport_w = max(340, self.scroll_area.viewport().width() - 24)
+                base_scale = viewport_w / max(1.0, page.rect.width)
+                matrix = fitz.Matrix(base_scale * self.zoom_factor, base_scale * self.zoom_factor)
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+                qimg = QImage(
+                    pix.samples,
+                    pix.width,
+                    pix.height,
+                    pix.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()
+                self.lbl_image.setPixmap(QPixmap.fromImage(qimg))
+        except Exception as exc:
+            self.lbl_image.setPixmap(QPixmap())
+            self.lbl_image.setText(f"Önizleme oluşturulamadı:\n{exc}")
+
+
 class MainWindow(QMainWindow):
     COL_SELECT = 0
     COL_NAME = 1
@@ -171,7 +376,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🖨️ Otomatik Fatura Yazdırma ve Akıllı Sayfa Tasarruf Sistemi")
-        self.resize(1240, 760)
+        self.resize(1380, 800)
+        self.setAcceptDrops(True)
 
         self.items: List[PdfInvoiceItem] = []
         self.current_folder: str = ""
@@ -289,24 +495,30 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(18, 16, 18, 16)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(16, 14, 16, 14)
+        main_layout.setSpacing(10)
 
-        # 1. Top Control Bar (Folder & Printer Selection)
+        # 1. Top Control Bar (Folder, Drag & Drop hint, Printer Selection, Preview Toggle)
         top_frame = QFrame()
         top_frame.setStyleSheet(
             "QFrame { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }"
         )
         top_layout = QHBoxLayout(top_frame)
-        top_layout.setContentsMargins(14, 10, 14, 10)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(12, 8, 12, 8)
+        top_layout.setSpacing(8)
 
-        self.btn_choose_folder = QPushButton("📁 Fatura Klasörü Seç")
+        self.btn_choose_folder = QPushButton("📁 Klasör Seç")
         self.btn_choose_folder.setObjectName("FolderBtn")
         self.btn_choose_folder.clicked.connect(self.choose_folder)
 
+        self.btn_add_files = QPushButton("➕ PDF Ekle")
+        self.btn_add_files.setToolTip("Bilgisayardan tek veya çoklu PDF dosyası seçip listeye ekle (veya sürükle-bırak)")
+        self.btn_add_files.clicked.connect(self.choose_pdf_files)
+
         self.txt_folder = QLineEdit()
-        self.txt_folder.setPlaceholderText("Henüz klasör seçilmedi...")
+        self.txt_folder.setPlaceholderText(
+            "Klasör seçin veya Klasör/PDF dosyalarını doğrudan bu pencereye sürükleyip bırakın..."
+        )
         self.txt_folder.setReadOnly(True)
 
         self.btn_refresh = QPushButton("🔄 Yenile")
@@ -317,21 +529,28 @@ class MainWindow(QMainWindow):
         lbl_printer.setStyleSheet("font-weight: 600; border: none;")
 
         self.cmb_printer = QComboBox()
-        self.cmb_printer.setMinimumWidth(240)
+        self.cmb_printer.setMinimumWidth(220)
         self.cmb_printer.currentTextChanged.connect(self.update_printer_status_badge)
 
-        self.lbl_printer_status = QLabel("Durum kontrol ediliyor...")
+        self.lbl_printer_status = QLabel("Kontrol ediliyor...")
         self.lbl_printer_status.setStyleSheet(
             "font-weight: 700; font-size: 12px; padding: 4px 10px; border-radius: 6px;"
         )
 
+        self.btn_toggle_preview = QPushButton("👁️ Önizleme Paneli: Açık")
+        self.btn_toggle_preview.setCheckable(True)
+        self.btn_toggle_preview.setChecked(True)
+        self.btn_toggle_preview.clicked.connect(self.toggle_preview_panel)
+
         top_layout.addWidget(self.btn_choose_folder)
+        top_layout.addWidget(self.btn_add_files)
         top_layout.addWidget(self.txt_folder, stretch=1)
         top_layout.addWidget(self.btn_refresh)
-        top_layout.addSpacing(12)
+        top_layout.addSpacing(8)
         top_layout.addWidget(lbl_printer)
         top_layout.addWidget(self.cmb_printer)
         top_layout.addWidget(self.lbl_printer_status)
+        top_layout.addWidget(self.btn_toggle_preview)
 
         main_layout.addWidget(top_frame)
 
@@ -413,12 +632,14 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(toolbar_frame)
 
-        # 4. Invoice Table
+        # 4. Center Splitter: Left = Invoice Table, Right = Built-in Fast PDF Preview Panel
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             [
                 "Yazdır",
-                "Fatura Dosya Adı (Çift Tıkla: Aç)",
+                "Fatura Dosya Adı (Tıkla: Önizle | Çift Tıkla: Aç)",
                 "PDF Analiz & Sayfa Durumu",
                 "Basılacak Sayfa Seçimi",
                 "Kopya Sayısı",
@@ -429,7 +650,10 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.cellClicked.connect(self.on_table_cell_clicked)
+        self.table.currentCellChanged.connect(self.on_current_cell_changed)
         self.table.cellDoubleClicked.connect(self.on_table_double_clicked)
         self.table.itemChanged.connect(self.on_table_item_changed)
 
@@ -446,7 +670,15 @@ class MainWindow(QMainWindow):
         )
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
 
-        main_layout.addWidget(self.table, stretch=1)
+        self.preview_panel = PdfPreviewPanel()
+
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.preview_panel)
+        self.splitter.setStretchFactor(0, 62)
+        self.splitter.setStretchFactor(1, 38)
+        self.splitter.setSizes([820, 520])
+
+        main_layout.addWidget(self.splitter, stretch=1)
 
         # 5. Bottom Action & Options Bar
         bottom_frame = QFrame()
@@ -505,7 +737,9 @@ class MainWindow(QMainWindow):
         action_row = QHBoxLayout()
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Hazır - Klasör seçip yazdırmayı başlatabilirsiniz")
+        self.progress_bar.setFormat(
+            "Hazır — Klasör seçebilir veya PDF dosyalarını sürükleyip bırakabilirsiniz"
+        )
 
         self.btn_open_archive = QPushButton("📂 Yazdırılanlar Klasörünü Aç")
         self.btn_open_archive.clicked.connect(self.open_archive_folder)
@@ -520,6 +754,96 @@ class MainWindow(QMainWindow):
 
         bottom_layout.addLayout(action_row)
         main_layout.addWidget(bottom_frame)
+
+    # --- Drag & Drop Support ---
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                local_path = Path(url.toLocalFile())
+                if local_path.is_dir() or local_path.suffix.lower() == ".pdf":
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+
+        folders: List[Path] = []
+        pdf_files: List[Path] = []
+
+        for url in urls:
+            p = Path(url.toLocalFile())
+            if p.is_dir():
+                folders.append(p)
+            elif p.is_file() and p.suffix.lower() == ".pdf":
+                pdf_files.append(p)
+
+        # If a folder is dropped, load that folder directly
+        if folders and not pdf_files:
+            self.load_folder(str(folders[0]))
+            return
+
+        # If PDF files (or mix of folders and PDFs) are dropped, add/load them
+        all_pdfs: List[Path] = list(pdf_files)
+        for folder in folders:
+            for sub_p in folder.rglob("*.pdf"):
+                if "yazdırılanlar" not in [part.lower() for part in sub_p.parts]:
+                    all_pdfs.append(sub_p)
+
+        if all_pdfs:
+            self.add_dropped_pdf_files(all_pdfs)
+
+    def choose_pdf_files(self):
+        start_dir = self.current_folder if self.current_folder else str(Path.home())
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Listeye Eklenecek PDF Faturaları Seçin",
+            start_dir,
+            "PDF Dosyaları (*.pdf)",
+        )
+        if files:
+            self.add_dropped_pdf_files([Path(f) for f in files])
+
+    def add_dropped_pdf_files(self, pdf_paths: List[Path]):
+        existing_paths = {item.file_path.resolve() for item in self.items if item.file_path.exists()}
+        added_count = 0
+
+        for p in pdf_paths:
+            try:
+                resolved = p.resolve()
+            except Exception:
+                resolved = p
+            if resolved in existing_paths:
+                continue
+            item = analyze_single_pdf_file(
+                pdf_path=p,
+                base_folder=None,
+                default_copies=1,
+                smart_skip_redundant_pages=self.chk_smart_skip.isChecked(),
+            )
+            self.items.append(item)
+            existing_paths.add(resolved)
+            added_count += 1
+
+        if added_count > 0:
+            if not self.current_folder and pdf_paths:
+                self.current_folder = str(pdf_paths[0].parent)
+                self.txt_folder.setText(f"{self.current_folder} (Sürükle-Bırak / Seçilen Dosyalar)")
+            self.populate_table()
+            self.update_summary_cards()
+            self.progress_bar.setFormat(
+                f"{added_count} adet yeni PDF eklendi (Toplam: {len(self.items)} fatura)."
+            )
+            if self.table.rowCount() > 0:
+                self.table.selectRow(self.table.rowCount() - added_count)
+
+    def toggle_preview_panel(self, checked: bool):
+        self.preview_panel.setVisible(checked)
+        self.btn_toggle_preview.setText(
+            "👁️ Önizleme Paneli: Açık" if checked else "👁️ Önizleme Paneli: Kapalı"
+        )
 
     def _load_printers(self):
         self.cmb_printer.clear()
@@ -570,6 +894,10 @@ class MainWindow(QMainWindow):
             self.chk_date_subfolder.setChecked(data.get("date_subfolder", False))
             self.chk_duplex.setChecked(data.get("duplex", False))
 
+            show_prev = data.get("show_preview", True)
+            self.btn_toggle_preview.setChecked(show_prev)
+            self.toggle_preview_panel(show_prev)
+
             if last_printer and self.cmb_printer.findText(last_printer) >= 0:
                 self.cmb_printer.setCurrentText(last_printer)
 
@@ -588,8 +916,11 @@ class MainWindow(QMainWindow):
                 "auto_move": self.chk_auto_move.isChecked(),
                 "date_subfolder": self.chk_date_subfolder.isChecked(),
                 "duplex": self.chk_duplex.isChecked(),
+                "show_preview": self.btn_toggle_preview.isChecked(),
             }
-            CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            CONFIG_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         except Exception:
             pass
 
@@ -620,9 +951,12 @@ class MainWindow(QMainWindow):
                 if isinstance(cmb, QComboBox):
                     cmb.blockSignals(True)
                     cmb.setCurrentIndex(0 if checked else 1)
+                    self._style_range_combo(cmb, item.force_print_all)
                     cmb.blockSignals(False)
                 self._update_row_total_sheets_cell(row)
         self.update_summary_cards()
+        if self.preview_panel.current_item:
+            self.preview_panel._render_current_page()
 
     def load_folder(self, folder_path: str):
         self.current_folder = folder_path
@@ -638,9 +972,12 @@ class MainWindow(QMainWindow):
         self.update_summary_cards()
 
         if not self.items:
+            self.preview_panel.clear_preview()
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("Seçilen klasörde PDF dosyası bulunamadı.")
         else:
+            self.table.selectRow(0)
+            self.preview_panel.load_invoice_item(self.items[0])
             redundant_cnt = sum(1 for i in self.items if i.page2_is_redundant)
             if redundant_cnt > 0:
                 self.progress_bar.setValue(0)
@@ -691,7 +1028,9 @@ class MainWindow(QMainWindow):
             page_item = QTableWidgetItem(item.page_badge_text)
             page_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             page_item.setFont(bold_font)
-            page_item.setToolTip("\n".join(tooltip_lines[1:]) if len(tooltip_lines) > 1 else "")
+            page_item.setToolTip(
+                "\n".join(tooltip_lines[1:]) if len(tooltip_lines) > 1 else ""
+            )
 
             if item.page_count <= 0:
                 page_item.setForeground(QColor("#DC2626"))
@@ -700,16 +1039,14 @@ class MainWindow(QMainWindow):
                 page_item.setForeground(QColor("#15803D"))
                 page_item.setBackground(QColor("#DCFCE7"))
             elif item.page2_is_redundant:
-                # Teal badge: 2 pages in PDF, but page 2 is redundant bank/footer info
                 page_item.setForeground(QColor("#0F766E"))
                 page_item.setBackground(QColor("#CCFBF1"))
             else:
-                # Amber badge: Multi-page where page 2 has real items or total
                 page_item.setForeground(QColor("#B45309"))
                 page_item.setBackground(QColor("#FEF3C7"))
             self.table.setItem(row, self.COL_PAGES, page_item)
 
-            # 3. Print Page Range Selector (For 2+ page PDFs, user can choose 'Sadece 1. Sayfa' or 'Tüm Sayfalar')
+            # 3. Print Page Range Selector
             if item.page_count >= 2:
                 cmb_range = QComboBox()
                 cmb_range.addItem("✂️ Sadece 1. Sayfa (2.yi Atla)")
@@ -738,7 +1075,9 @@ class MainWindow(QMainWindow):
             spin.setStyleSheet(
                 "QSpinBox { font-weight: bold; padding: 3px 6px; margin: 4px 10px; }"
             )
-            spin.valueChanged.connect(lambda val, r=row: self.on_row_copies_changed(r, val))
+            spin.valueChanged.connect(
+                lambda val, r=row: self.on_row_copies_changed(r, val)
+            )
             self.table.setCellWidget(row, self.COL_COPIES, spin)
 
             # 5. Total Printed Pages for this Invoice
@@ -768,7 +1107,9 @@ class MainWindow(QMainWindow):
                 "QComboBox { background-color: #FFFBEB; color: #B45309; border: 1px solid #FCD34D; font-weight: 700; margin: 4px 6px; }"
             )
 
-    def _style_status_cell(self, cell: QTableWidgetItem, status: str, error_msg: str = ""):
+    def _style_status_cell(
+        self, cell: QTableWidgetItem, status: str, error_msg: str = ""
+    ):
         cell.setText(status)
         if error_msg:
             cell.setToolTip(error_msg)
@@ -778,12 +1119,25 @@ class MainWindow(QMainWindow):
         elif "Hata" in status:
             cell.setForeground(QColor("#B91C1C"))
             cell.setBackground(QColor("#FEE2E2"))
-        elif "Yazdırılıyor" in status or "Basıyor" in status or "Gönderiliyor" in status or "Kopya" in status:
+        elif (
+            "Yazdırılıyor" in status
+            or "Basıyor" in status
+            or "Gönderiliyor" in status
+            or "Kopya" in status
+        ):
             cell.setForeground(QColor("#1D4ED8"))
             cell.setBackground(QColor("#DBEAFE"))
         else:
             cell.setForeground(QColor("#475569"))
             cell.setBackground(QColor("#F8FAFC"))
+
+    def on_table_cell_clicked(self, row: int, _col: int):
+        if 0 <= row < len(self.items):
+            self.preview_panel.load_invoice_item(self.items[row])
+
+    def on_current_cell_changed(self, current_row: int, _current_col: int, prev_row: int, _prev_col: int):
+        if current_row != prev_row and 0 <= current_row < len(self.items):
+            self.preview_panel.load_invoice_item(self.items[current_row])
 
     def on_row_range_changed(self, row: int, combo_index: int):
         if 0 <= row < len(self.items):
@@ -796,6 +1150,8 @@ class MainWindow(QMainWindow):
                 self._style_range_combo(cmb, item.force_print_all)
             self._update_row_total_sheets_cell(row)
             self.update_summary_cards()
+            if self.preview_panel.current_item == item:
+                self.preview_panel._render_current_page()
 
     def _update_row_total_sheets_cell(self, row: int):
         if 0 <= row < len(self.items):
@@ -913,7 +1269,9 @@ class MainWindow(QMainWindow):
 
         printer_name = self.cmb_printer.currentText()
         if not printer_name or printer_name == "Yazıcı Bulunamadı":
-            QMessageBox.warning(self, "Yazıcı Hatası", "Lütfen geçerli bir yazıcı seçin.")
+            QMessageBox.warning(
+                self, "Yazıcı Hatası", "Lütfen geçerli bir yazıcı seçin."
+            )
             return
 
         self.update_printer_status_badge()
@@ -984,6 +1342,7 @@ class MainWindow(QMainWindow):
         self._save_settings()
         self.btn_print.setEnabled(False)
         self.btn_choose_folder.setEnabled(False)
+        self.btn_add_files.setEnabled(False)
         self.btn_refresh.setEnabled(False)
 
         self.progress_bar.setMaximum(len(jobs))
@@ -1027,6 +1386,7 @@ class MainWindow(QMainWindow):
     def on_print_finished(self, success_count: int, fail_count: int):
         self.btn_print.setEnabled(True)
         self.btn_choose_folder.setEnabled(True)
+        self.btn_add_files.setEnabled(True)
         self.btn_refresh.setEnabled(True)
         self.update_summary_cards()
         self.update_printer_status_badge()
@@ -1038,7 +1398,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Yazdırma Tamamlandı",
-                f"{success_count} adet fatura başarıyla yazıcıya gönderildi.",
+                f"{success_count} adet fatura başarıyla yazdırıldı.",
             )
         else:
             QMessageBox.warning(

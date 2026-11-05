@@ -28,3 +28,4 @@ Veya klasör içindeki `Baslat.bat` / `FaturaYazdirici.vbs` dosyasına çift tı
 .\.venv\Scripts\pyinstaller --noconfirm --clean --windowed --onefile --name "FaturaYazdirici" --icon "app_icon.ico" main.py
 ```
 Derlenen `FaturaYazdirici.exe` dosyası `dist/` klasörü altında oluşturulur.
+
