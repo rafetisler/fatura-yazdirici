@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List
 
 import pymupdf as fitz  # PyMuPDF
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -383,6 +383,12 @@ class MainWindow(QMainWindow):
         self.current_folder: str = ""
         self.worker: PrintWorker | None = None
         self._updating_table = False
+        self._auto_pilot_pending_trigger = False
+
+        # Watchdog Timer for Auto-Pilot Folder Monitoring
+        self.watch_timer = QTimer(self)
+        self.watch_timer.setInterval(3000)  # Check every 3 seconds
+        self.watch_timer.timeout.connect(self._on_watchdog_tick)
 
         self._apply_global_styles()
         self._build_ui()
@@ -542,10 +548,22 @@ class MainWindow(QMainWindow):
         self.btn_toggle_preview.setChecked(True)
         self.btn_toggle_preview.clicked.connect(self.toggle_preview_panel)
 
+        self.btn_auto_pilot = QPushButton("👀 Otomatik Pilot (Canlı İzle): Kapalı")
+        self.btn_auto_pilot.setCheckable(True)
+        self.btn_auto_pilot.setChecked(False)
+        self.btn_auto_pilot.setToolTip(
+            "Aktif edildiğinde seçili klasörü her 3 saniyede bir canlı izler.\n"
+            "Klasöre yeni düşen PDF faturaları otomatik analiz eder, gereksiz 2. sayfasını atlar,\n"
+            "yazıcıdan çıktısını alır ve 'Yazdırılanlar' klasörüne taşır!"
+        )
+        self.btn_auto_pilot.clicked.connect(self.toggle_auto_pilot)
+        self._style_auto_pilot_btn(False)
+
         top_layout.addWidget(self.btn_choose_folder)
         top_layout.addWidget(self.btn_add_files)
         top_layout.addWidget(self.txt_folder, stretch=1)
         top_layout.addWidget(self.btn_refresh)
+        top_layout.addWidget(self.btn_auto_pilot)
         top_layout.addSpacing(8)
         top_layout.addWidget(lbl_printer)
         top_layout.addWidget(self.cmb_printer)
@@ -844,6 +862,130 @@ class MainWindow(QMainWindow):
         self.btn_toggle_preview.setText(
             "👁️ Önizleme Paneli: Açık" if checked else "👁️ Önizleme Paneli: Kapalı"
         )
+
+    def _style_auto_pilot_btn(self, active: bool):
+        if active:
+            self.btn_auto_pilot.setText("🟢 Otomatik Pilot (Canlı İzliyor)")
+            self.btn_auto_pilot.setStyleSheet(
+                "QPushButton { background-color: #16A34A; color: #FFFFFF; border: 1px solid #15803D; font-weight: 700; padding: 6px 14px; border-radius: 6px; }"
+                "QPushButton:hover { background-color: #15803D; }"
+            )
+        else:
+            self.btn_auto_pilot.setText("👀 Otomatik Pilot (Canlı İzle): Kapalı")
+            self.btn_auto_pilot.setStyleSheet(
+                "QPushButton { background-color: #F8FAFC; color: #334155; border: 1px solid #CBD5E1; font-weight: 600; padding: 6px 14px; border-radius: 6px; }"
+                "QPushButton:hover { background-color: #E2E8F0; }"
+            )
+
+    def toggle_auto_pilot(self, checked: bool):
+        if checked and (not self.current_folder or not Path(self.current_folder).exists()):
+            QMessageBox.information(
+                self,
+                "Önce Klasör Seçin",
+                "Otomatik Pilot (Canlı İzleme) modunu başlatmak için lütfen önce izlenecek fatura klasörünü seçin.",
+            )
+            self.btn_auto_pilot.setChecked(False)
+            self._style_auto_pilot_btn(False)
+            return
+
+        self._style_auto_pilot_btn(checked)
+        if checked:
+            self.watch_timer.start()
+            self.progress_bar.setFormat(
+                f"🟢 Otomatik Pilot Aktif: '{self.current_folder}' klasörü canlı izleniyor..."
+            )
+            # Trigger an immediate scan & print if unprinted files exist
+            self._on_watchdog_tick()
+        else:
+            self.watch_timer.stop()
+            self._auto_pilot_pending_trigger = False
+            self.progress_bar.setFormat("Otomatik Pilot kapatıldı.")
+
+    def _on_watchdog_tick(self):
+        """Periodically checks the watched folder for newly arrived PDF files and auto-prints them."""
+        if not self.btn_auto_pilot.isChecked():
+            return
+        if not self.current_folder:
+            return
+
+        folder = Path(self.current_folder)
+        if not folder.exists() or not folder.is_dir():
+            return
+
+        # If currently printing, wait until current batch completes
+        if self.worker and self.worker.isRunning():
+            return
+
+        # Discover all current PDF files in folder (excluding 'Yazdırılanlar')
+        known_paths = set()
+        for item in self.items:
+            try:
+                known_paths.add(item.file_path.resolve())
+            except Exception:
+                known_paths.add(item.file_path)
+
+        new_pdf_paths: List[Path] = []
+        for p in folder.rglob("*"):
+            if "yazdırılanlar" in [part.lower() for part in p.parts]:
+                continue
+            if not (p.is_file() and p.suffix.lower() == ".pdf"):
+                continue
+            try:
+                resolved = p.resolve()
+            except Exception:
+                resolved = p
+
+            if resolved not in known_paths:
+                # Verify file is completely written (not partial download) and > 0 bytes
+                try:
+                    if p.stat().st_size <= 0:
+                        continue
+                    with fitz.open(p) as test_doc:
+                        if len(test_doc) <= 0:
+                            continue
+                except Exception:
+                    # Still being downloaded/written by browser or Google Drive; skip until next tick
+                    continue
+                new_pdf_paths.append(p)
+
+        if new_pdf_paths:
+            new_pdf_paths.sort(key=lambda x: str(x).lower())
+            for np in new_pdf_paths:
+                new_item = analyze_single_pdf_file(
+                    pdf_path=np,
+                    base_folder=folder,
+                    default_copies=1,
+                    smart_skip_redundant_pages=self.chk_smart_skip.isChecked(),
+                )
+                self.items.append(new_item)
+
+            self.populate_table()
+            self.update_summary_cards()
+            if self.table.rowCount() > 0:
+                self.table.selectRow(self.table.rowCount() - 1)
+
+        # Check if there are any selected unprinted items waiting to be printed
+        pending_jobs = [
+            (row, item)
+            for row, item in enumerate(self.items)
+            if item.selected
+            and item.page_count > 0
+            and item.status == "Bekliyor"
+            and item.file_path.exists()
+        ]
+
+        if pending_jobs:
+            printer_name = self.cmb_printer.currentText()
+            is_ready, status_text, _ = check_printer_status(printer_name)
+            self.update_printer_status_badge()
+            if not is_ready:
+                self.progress_bar.setFormat(
+                    f"👀 Otomatik Pilot Beklemede: {len(pending_jobs)} yeni fatura algılandı, yazıcının açılması bekleniyor ({status_text})..."
+                )
+                return
+
+            # Start silent automatic printing of pending jobs!
+            self.start_printing(silent_auto=True)
 
     def _load_printers(self):
         self.cmb_printer.clear()
@@ -1263,34 +1405,40 @@ class MainWindow(QMainWindow):
         archive_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(archive_dir))
 
-    def start_printing(self):
+    def start_printing(self, silent_auto: bool = False):
         if self.worker and self.worker.isRunning():
             return
 
         printer_name = self.cmb_printer.currentText()
         if not printer_name or printer_name == "Yazıcı Bulunamadı":
-            QMessageBox.warning(
-                self, "Yazıcı Hatası", "Lütfen geçerli bir yazıcı seçin."
-            )
+            if not silent_auto:
+                QMessageBox.warning(
+                    self, "Yazıcı Hatası", "Lütfen geçerli bir yazıcı seçin."
+                )
             return
 
         self.update_printer_status_badge()
         is_ready, status_text, pending_jobs = check_printer_status(printer_name)
-        if not is_ready and self.chk_auto_move.isChecked():
-            warn_reply = QMessageBox.warning(
-                self,
-                "⚠️ Yazıcı Şu Anda Çevrimdışı / Hazır Değil!",
-                f"Seçili yazıcı ({printer_name}) şu anda hazır görünmüyor:\n"
-                f"Durum: {status_text}\n"
-                f"Kuyrukta Bekleyen İş: {pending_jobs} adet\n\n"
-                f"Yazıcı kapalı veya çevrimdışıyken gönderilen belgeler Windows yazdırma kuyruğunda bekler ve yazıcı açıldığında basılır.\n\n"
-                f"• 'Yes (Evet)' derseniz: Belgeler kuyruğa eklenir ANCAK yazıcı çevrimdışı olduğu için dosyalar 'Yazdırılanlar' klasörüne TAŞINMAZ (klasörünüzde kalır).\n"
-                f"• 'No (Hayır)' derseniz: İşlem iptal edilir (Önce yazıcınızı açıp tekrar deneyebilirsiniz).",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if warn_reply != QMessageBox.StandardButton.Yes:
+        if not is_ready:
+            if silent_auto:
                 return
-            effective_auto_move = False
+            if self.chk_auto_move.isChecked():
+                warn_reply = QMessageBox.warning(
+                    self,
+                    "⚠️ Yazıcı Şu Anda Çevrimdışı / Hazır Değil!",
+                    f"Seçili yazıcı ({printer_name}) şu anda hazır görünmüyor:\n"
+                    f"Durum: {status_text}\n"
+                    f"Kuyrukta Bekleyen İş: {pending_jobs} adet\n\n"
+                    f"Yazıcı kapalı veya çevrimdışıyken gönderilen belgeler Windows yazdırma kuyruğunda bekler ve yazıcı açıldığında basılır.\n\n"
+                    f"• 'Yes (Evet)' derseniz: Belgeler kuyruğa eklenir ANCAK yazıcı çevrimdışı olduğu için dosyalar 'Yazdırılanlar' klasörüne TAŞINMAZ (klasörünüzde kalır).\n"
+                    f"• 'No (Hayır)' derseniz: İşlem iptal edilir (Önce yazıcınızı açıp tekrar deneyebilirsiniz).",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if warn_reply != QMessageBox.StandardButton.Yes:
+                    return
+                effective_auto_move = False
+            else:
+                effective_auto_move = False
         else:
             effective_auto_move = self.chk_auto_move.isChecked()
 
@@ -1301,44 +1449,47 @@ class MainWindow(QMainWindow):
         ]
 
         if not jobs:
-            QMessageBox.information(
-                self,
-                "Seçili Fatura Yok",
-                "Yazdırılacak işaretli bir PDF faturası bulunamadı.",
+            if not silent_auto:
+                QMessageBox.information(
+                    self,
+                    "Seçili Fatura Yok",
+                    "Yazdırılacak işaretli bir PDF faturası bulunamadı.",
+                )
+            return
+
+        if not silent_auto:
+            total_copies_pages = sum(
+                item.effective_pages_to_print * item.copies for _, item in jobs
             )
-            return
+            saved_pages = sum(
+                (item.page_count - item.effective_pages_to_print) * item.copies
+                for _, item in jobs
+                if item.page_count > item.effective_pages_to_print
+            )
+            multi_count = sum(
+                1 for _, item in jobs if item.effective_pages_to_print >= 2
+            )
 
-        total_copies_pages = sum(
-            item.effective_pages_to_print * item.copies for _, item in jobs
-        )
-        saved_pages = sum(
-            (item.page_count - item.effective_pages_to_print) * item.copies
-            for _, item in jobs
-            if item.page_count > item.effective_pages_to_print
-        )
-        multi_count = sum(
-            1 for _, item in jobs if item.effective_pages_to_print >= 2
-        )
+            confirm_msg = (
+                f"Seçili Yazıcı: {printer_name}\n"
+                f"Yazdırılacak Fatura Sayısı: {len(jobs)} adet\n"
+                f"  • Tek Sayfa Basılacak: {len(jobs) - multi_count} adet\n"
+                f"  • Çok Sayfa Basılacak: {multi_count} adet\n"
+                f"  • Gereksiz 2. Sayfadan Kurtarılan: {saved_pages} yaprak kağıt\n"
+                f"Toplam Basılacak Net Kağıt: {total_copies_pages} sayfa\n\n"
+                f"Yazdırma işlemini başlatmak istiyor musunuz?"
+            )
 
-        confirm_msg = (
-            f"Seçili Yazıcı: {printer_name}\n"
-            f"Yazdırılacak Fatura Sayısı: {len(jobs)} adet\n"
-            f"  • Tek Sayfa Basılacak: {len(jobs) - multi_count} adet\n"
-            f"  • Çok Sayfa Basılacak: {multi_count} adet\n"
-            f"  • Gereksiz 2. Sayfadan Kurtarılan: {saved_pages} yaprak kağıt\n"
-            f"Toplam Basılacak Net Kağıt: {total_copies_pages} sayfa\n\n"
-            f"Yazdırma işlemini başlatmak istiyor musunuz?"
-        )
+            reply = QMessageBox.question(
+                self,
+                "Yazdırma Onayı",
+                confirm_msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
-        reply = QMessageBox.question(
-            self,
-            "Yazdırma Onayı",
-            confirm_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
+        self._last_batch_was_silent_auto = silent_auto
         self._save_settings()
         self.btn_print.setEnabled(False)
         self.btn_choose_folder.setEnabled(False)
@@ -1390,6 +1541,12 @@ class MainWindow(QMainWindow):
         self.btn_refresh.setEnabled(True)
         self.update_summary_cards()
         self.update_printer_status_badge()
+
+        was_silent = getattr(self, "_last_batch_was_silent_auto", False)
+        if was_silent and self.btn_auto_pilot.isChecked():
+            summary = f"🟢 Otomatik Pilot: {success_count} fatura otomatik basıldı (Hata: {fail_count}) — Canlı izleme devam ediyor..."
+            self.progress_bar.setFormat(summary)
+            return
 
         summary = f"Tamamlandı! Başarılı: {success_count} | Hatalı: {fail_count}"
         self.progress_bar.setFormat(summary)
