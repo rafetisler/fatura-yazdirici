@@ -94,12 +94,37 @@ def get_installed_printers() -> Tuple[List[str], str]:
     except Exception:
         default_printer = ""
 
-    try:
-        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-        enum_result = win32print.EnumPrinters(flags)
-        printers = [p[2] for p in enum_result if p and len(p) > 2]
-    except Exception:
-        pass
+    for flags in (
+        win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS,
+        win32print.PRINTER_ENUM_LOCAL,
+    ):
+        try:
+            enum_result = win32print.EnumPrinters(flags)
+            for p in enum_result:
+                if p and len(p) > 2 and p[2] and p[2] not in printers:
+                    printers.append(p[2])
+            if printers:
+                break
+        except Exception:
+            continue
+
+    # PowerShell fallback if win32print enumeration fails on some systems
+    if not printers:
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", "Get-Printer | Select-Object -ExpandProperty Name"],
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=0x08000000,
+            )
+            for line in out.splitlines():
+                name = line.strip()
+                if name and name not in printers:
+                    printers.append(name)
+        except Exception:
+            pass
 
     if default_printer and default_printer not in printers:
         printers.insert(0, default_printer)

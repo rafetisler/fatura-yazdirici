@@ -484,6 +484,25 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
                 color: #0F172A;
             }
+            QComboBox QAbstractItemView {
+                background-color: #FFFFFF;
+                color: #0F172A;
+                selection-background-color: #2563EB;
+                selection-color: #FFFFFF;
+                border: 1px solid #CBD5E1;
+                outline: 0px;
+                padding: 4px;
+            }
+            QComboBox QAbstractItemView::item {
+                min-height: 28px;
+                padding: 4px 8px;
+                color: #0F172A;
+                background-color: #FFFFFF;
+            }
+            QComboBox QAbstractItemView::item:selected {
+                background-color: #2563EB;
+                color: #FFFFFF;
+            }
             QTableWidget {
                 background-color: #FFFFFF;
                 alternate-background-color: #F8FAFC;
@@ -1110,6 +1129,10 @@ class MainWindow(QMainWindow):
             self.load_folder(folder)
 
     def refresh_folder(self):
+        current_p = self.cmb_printer.currentText()
+        self._load_printers()
+        if current_p and self.cmb_printer.findText(current_p) >= 0:
+            self.cmb_printer.setCurrentText(current_p)
         self.update_printer_status_badge()
         if self.current_folder and Path(self.current_folder).exists():
             self.load_folder(self.current_folder)
