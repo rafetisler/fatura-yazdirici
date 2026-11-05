@@ -1,0 +1,16 @@
+# Virtual environment & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build artifacts & large binaries
+build/
+dist/
+*.spec
+*.exe
+
+# User runtime settings & sample output
+settings.json
+ornek_faturalar/
+Yazdırılanlar/
