@@ -58,6 +58,44 @@ def _get_settings_file() -> Path:
 CONFIG_FILE = _get_settings_file()
 
 
+class FolderScanWorker(QThread):
+    """Background worker to scan and analyze PDFs in parallel without freezing the UI."""
+
+    progress_changed = pyqtSignal(int, int, str)  # current, total, filename
+    scan_finished = pyqtSignal(str, list)  # folder_path, List[PdfInvoiceItem]
+
+    def __init__(self, folder_path: str, smart_skip: bool):
+        super().__init__()
+        self.folder_path = folder_path
+        self.smart_skip = smart_skip
+
+    def run(self):
+        items = scan_folder_for_pdfs(
+            folder_path=self.folder_path,
+            default_copies=1,
+            smart_skip_redundant_pages=self.smart_skip,
+            include_subfolders=True,
+            progress_callback=lambda cur, tot, name: self.progress_changed.emit(
+                cur, tot, name
+            ),
+        )
+        self.scan_finished.emit(self.folder_path, items)
+
+
+class PrinterStatusWorker(QThread):
+    """Non-blocking background checker for network/local printer status."""
+
+    status_ready = pyqtSignal(str, bool, str, int)  # printer_name, is_ready, text, jobs
+
+    def __init__(self, printer_name: str):
+        super().__init__()
+        self.printer_name = printer_name
+
+    def run(self):
+        is_ready, status_text, jobs = check_printer_status(self.printer_name)
+        self.status_ready.emit(self.printer_name, is_ready, status_text, jobs)
+
+
 class PrintWorker(QThread):
     """Background thread to print selected PDFs without freezing the UI."""
 
@@ -387,8 +425,17 @@ class MainWindow(QMainWindow):
         self.items: List[PdfInvoiceItem] = []
         self.current_folder: str = ""
         self.worker: PrintWorker | None = None
+        self.scan_worker: FolderScanWorker | None = None
+        self.printer_status_worker: PrinterStatusWorker | None = None
         self._updating_table = False
         self._auto_pilot_pending_trigger = False
+        self._pending_preview_row: int = -1
+
+        # Debounce timer for fast table scrolling -> preview rendering
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(110)
+        self.preview_timer.timeout.connect(self._trigger_debounced_preview)
 
         # Watchdog Timer for Auto-Pilot Folder Monitoring
         self.watch_timer = QTimer(self)
@@ -726,17 +773,19 @@ class MainWindow(QMainWindow):
         self.table.itemChanged.connect(self.on_table_item_changed)
 
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(self.COL_SELECT, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_SELECT, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_SELECT, 56)
         header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(self.COL_PAGES, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(
-            self.COL_PRINT_RANGE, QHeaderView.ResizeMode.ResizeToContents
-        )
-        header.setSectionResizeMode(self.COL_COPIES, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(
-            self.COL_TOTAL_SHEETS, QHeaderView.ResizeMode.ResizeToContents
-        )
-        header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_PAGES, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_PAGES, 175)
+        header.setSectionResizeMode(self.COL_PRINT_RANGE, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_PRINT_RANGE, 210)
+        header.setSectionResizeMode(self.COL_COPIES, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_COPIES, 105)
+        header.setSectionResizeMode(self.COL_TOTAL_SHEETS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_TOTAL_SHEETS, 85)
+        header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_STATUS, 130)
 
         self.preview_panel = PdfPreviewPanel()
 
@@ -905,7 +954,11 @@ class MainWindow(QMainWindow):
                 f"{added_count} adet yeni PDF eklendi (Toplam: {len(self.items)} fatura)."
             )
             if self.table.rowCount() > 0:
-                self.table.selectRow(self.table.rowCount() - added_count)
+                target_row = self.table.rowCount() - added_count
+                self._updating_table = True
+                self.table.selectRow(target_row)
+                self._updating_table = False
+                self._schedule_preview_for_row(target_row)
 
     def toggle_preview_panel(self, checked: bool):
         self.preview_panel.setVisible(checked)
@@ -1058,7 +1111,18 @@ class MainWindow(QMainWindow):
             )
             return
 
-        is_ready, status_text, jobs = check_printer_status(printer_name)
+        if self.printer_status_worker and self.printer_status_worker.isRunning():
+            return
+
+        self.printer_status_worker = PrinterStatusWorker(printer_name)
+        self.printer_status_worker.status_ready.connect(self._on_printer_status_ready)
+        self.printer_status_worker.start()
+
+    def _on_printer_status_ready(
+        self, printer_name: str, is_ready: bool, status_text: str, jobs: int
+    ):
+        if printer_name != self.cmb_printer.currentText():
+            return
         job_suffix = f" ({jobs} bekleyen iş)" if jobs > 0 else ""
         if is_ready:
             self.lbl_printer_status.setText(f"🟢 {status_text}{job_suffix}")
@@ -1155,144 +1219,182 @@ class MainWindow(QMainWindow):
             self.preview_panel._render_current_page()
 
     def load_folder(self, folder_path: str):
+        if self.scan_worker and self.scan_worker.isRunning():
+            return
+
         self.current_folder = folder_path
         self.txt_folder.setText(folder_path)
         self._save_settings()
 
-        self.items = scan_folder_for_pdfs(
-            folder_path,
-            default_copies=1,
-            smart_skip_redundant_pages=self.chk_smart_skip.isChecked(),
+        self.btn_choose_folder.setEnabled(False)
+        self.btn_add_files.setEnabled(False)
+        self.btn_refresh.setEnabled(False)
+        self.btn_print.setEnabled(False)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("🔍 PDF faturalar paralel analiz ediliyor, lütfen bekleyin...")
+
+        self.scan_worker = FolderScanWorker(
+            folder_path=folder_path,
+            smart_skip=self.chk_smart_skip.isChecked(),
         )
+        self.scan_worker.progress_changed.connect(self._on_scan_progress)
+        self.scan_worker.scan_finished.connect(self._on_scan_finished)
+        self.scan_worker.start()
+
+    def _on_scan_progress(self, current: int, total: int, filename: str):
+        self.progress_bar.setMaximum(max(1, total))
+        self.progress_bar.setValue(current)
+        self.progress_bar.setFormat(
+            f"🔍 Analiz ediliyor ({current}/{total}): {filename}"
+        )
+
+    def _on_scan_finished(self, _folder_path: str, scanned_items: list):
+        self.btn_choose_folder.setEnabled(True)
+        self.btn_add_files.setEnabled(True)
+        self.btn_refresh.setEnabled(True)
+        self.btn_print.setEnabled(True)
+
+        self.items = scanned_items
         self.populate_table()
         self.update_summary_cards()
 
         if not self.items:
             self.preview_panel.clear_preview()
+            self.progress_bar.setMaximum(100)
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat("Seçilen klasörde PDF dosyası bulunamadı.")
         else:
+            self._updating_table = True
             self.table.selectRow(0)
-            self.preview_panel.load_invoice_item(self.items[0])
+            self._updating_table = False
+            self._schedule_preview_for_row(0)
+
             redundant_cnt = sum(1 for i in self.items if i.page2_is_redundant)
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(0)
             if redundant_cnt > 0:
-                self.progress_bar.setValue(0)
                 self.progress_bar.setFormat(
                     f"{len(self.items)} fatura analiz edildi. ({redundant_cnt} faturada gereksiz 2. sayfa tespit edilip otomatik 1 sayfaya düşürüldü!)"
                 )
             else:
-                self.progress_bar.setValue(0)
                 self.progress_bar.setFormat(
                     f"{len(self.items)} adet PDF fatura analiz edildi ve listelendi."
                 )
 
     def populate_table(self):
         self._updating_table = True
-        self.table.setRowCount(len(self.items))
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self.items))
 
-        bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+            bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+            demi_font = QFont("Segoe UI", 10, QFont.Weight.DemiBold)
 
-        for row, item in enumerate(self.items):
-            self.table.setRowHeight(row, 42)
+            for row, item in enumerate(self.items):
+                self.table.setRowHeight(row, 40)
 
-            # 0. Checkbox
-            chk_item = QTableWidgetItem()
-            chk_item.setFlags(
-                Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-            )
-            chk_item.setCheckState(
-                Qt.CheckState.Checked if item.selected else Qt.CheckState.Unchecked
-            )
-            chk_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, self.COL_SELECT, chk_item)
-
-            # 1. File Name + Tooltip with Page 2 preview if multi-page
-            name_item = QTableWidgetItem(f"📄  {item.file_name}")
-            name_item.setForeground(QColor("#0F172A"))
-            name_item.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
-            tooltip_lines = [f"Dosya: {item.file_path}"]
-            if item.page_count >= 2:
-                tooltip_lines.append(f"Analiz: {item.page2_reason}")
-                if item.page2_preview:
-                    tooltip_lines.append(f"2. Sayfa İçeriği: {item.page2_preview}")
-            name_item.setToolTip("\n".join(tooltip_lines))
-            self.table.setItem(row, self.COL_NAME, name_item)
-
-            # 2. Page Analysis Badge
-            page_item = QTableWidgetItem(item.page_badge_text)
-            page_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            page_item.setFont(bold_font)
-            page_item.setToolTip(
-                "\n".join(tooltip_lines[1:]) if len(tooltip_lines) > 1 else ""
-            )
-
-            if item.page_count <= 0:
-                page_item.setForeground(QColor("#DC2626"))
-                page_item.setBackground(QColor("#FEE2E2"))
-            elif item.page_count == 1:
-                page_item.setForeground(QColor("#15803D"))
-                page_item.setBackground(QColor("#DCFCE7"))
-            elif item.page2_is_redundant:
-                page_item.setForeground(QColor("#0F766E"))
-                page_item.setBackground(QColor("#CCFBF1"))
-            else:
-                page_item.setForeground(QColor("#B45309"))
-                page_item.setBackground(QColor("#FEF3C7"))
-            self.table.setItem(row, self.COL_PAGES, page_item)
-
-            # 3. Print Page Range Selector
-            if item.page_count >= 2:
-                cmb_range = QComboBox()
-                cmb_range.addItem("✂️ Sadece 1. Sayfa (2.yi Atla)")
-                cmb_range.addItem(f"📑 Tüm Sayfalar (1-{item.page_count})")
-                cmb_range.setCurrentIndex(1 if item.force_print_all else 0)
-                cmb_range.setToolTip(
-                    f"Analiz Sonucu: {item.page2_reason}\n"
-                    f"2. Sayfa Özeti: {item.page2_preview}"
+                # 0. Checkbox
+                chk_item = QTableWidgetItem()
+                chk_item.setFlags(
+                    Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
                 )
-                self._style_range_combo(cmb_range, item.force_print_all)
-                cmb_range.currentIndexChanged.connect(
-                    lambda idx, r=row: self.on_row_range_changed(r, idx)
+                chk_item.setCheckState(
+                    Qt.CheckState.Checked if item.selected else Qt.CheckState.Unchecked
                 )
-                self.table.setCellWidget(row, self.COL_PRINT_RANGE, cmb_range)
-            else:
-                single_lbl_item = QTableWidgetItem("1. Sayfa")
-                single_lbl_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                single_lbl_item.setForeground(QColor("#64748B"))
-                self.table.setItem(row, self.COL_PRINT_RANGE, single_lbl_item)
+                chk_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row, self.COL_SELECT, chk_item)
 
-            # 4. Copies SpinBox Widget
-            spin = QSpinBox()
-            spin.setRange(1, 99)
-            spin.setValue(item.copies)
-            spin.setMinimumWidth(85)
-            spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            spin.setStyleSheet(
-                "QSpinBox { font-weight: bold; padding: 3px 8px; margin: 4px 8px; }"
-            )
-            spin.valueChanged.connect(
-                lambda val, r=row: self.on_row_copies_changed(r, val)
-            )
-            self.table.setCellWidget(row, self.COL_COPIES, spin)
+                # 1. File Name + Tooltip with Page 2 preview if multi-page
+                name_item = QTableWidgetItem(f"📄  {item.file_name}")
+                name_item.setForeground(QColor("#0F172A"))
+                name_item.setFont(demi_font)
+                tooltip_lines = [f"Dosya: {item.file_path}"]
+                if item.page_count >= 2:
+                    tooltip_lines.append(f"Analiz: {item.page2_reason}")
+                    if item.page2_preview:
+                        tooltip_lines.append(f"2. Sayfa İçeriği: {item.page2_preview}")
+                name_item.setToolTip("\n".join(tooltip_lines))
+                self.table.setItem(row, self.COL_NAME, name_item)
 
-            # 5. Total Printed Pages for this Invoice
-            total_pages = item.effective_pages_to_print * item.copies
-            sheets_item = QTableWidgetItem(f"{total_pages} Sayfa")
-            sheets_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            sheets_item.setForeground(QColor("#1E293B"))
-            sheets_item.setFont(bold_font)
-            self.table.setItem(row, self.COL_TOTAL_SHEETS, sheets_item)
+                # 2. Page Analysis Badge
+                page_item = QTableWidgetItem(item.page_badge_text)
+                page_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                page_item.setFont(bold_font)
+                page_item.setToolTip(
+                    "\n".join(tooltip_lines[1:]) if len(tooltip_lines) > 1 else ""
+                )
 
-            # 6. Status
-            status_item = QTableWidgetItem(item.status)
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            status_item.setFont(bold_font)
-            self._style_status_cell(status_item, item.status, item.error_message)
-            self.table.setItem(row, self.COL_STATUS, status_item)
+                if item.page_count <= 0:
+                    page_item.setForeground(QColor("#DC2626"))
+                    page_item.setBackground(QColor("#FEE2E2"))
+                elif item.page_count == 1:
+                    page_item.setForeground(QColor("#15803D"))
+                    page_item.setBackground(QColor("#DCFCE7"))
+                elif item.page2_is_redundant:
+                    page_item.setForeground(QColor("#0F766E"))
+                    page_item.setBackground(QColor("#CCFBF1"))
+                else:
+                    page_item.setForeground(QColor("#B45309"))
+                    page_item.setBackground(QColor("#FEF3C7"))
+                self.table.setItem(row, self.COL_PAGES, page_item)
 
-        self._updating_table = False
+                # 3. Print Page Range Selector
+                if item.page_count >= 2:
+                    cmb_range = QComboBox()
+                    cmb_range.addItem("✂️ Sadece 1. Sayfa (2.yi Atla)")
+                    cmb_range.addItem(f"📑 Tüm Sayfalar (1-{item.page_count})")
+                    cmb_range.setCurrentIndex(1 if item.force_print_all else 0)
+                    cmb_range.setToolTip(
+                        f"Analiz Sonucu: {item.page2_reason}\n"
+                        f"2. Sayfa Özeti: {item.page2_preview}"
+                    )
+                    self._style_range_combo(cmb_range, item.force_print_all)
+                    cmb_range.currentIndexChanged.connect(
+                        lambda idx, r=row: self.on_row_range_changed(r, idx)
+                    )
+                    self.table.setCellWidget(row, self.COL_PRINT_RANGE, cmb_range)
+                else:
+                    single_lbl_item = QTableWidgetItem("1. Sayfa")
+                    single_lbl_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    single_lbl_item.setForeground(QColor("#64748B"))
+                    self.table.setItem(row, self.COL_PRINT_RANGE, single_lbl_item)
+
+                # 4. Copies SpinBox Widget
+                spin = QSpinBox()
+                spin.setRange(1, 99)
+                spin.setValue(item.copies)
+                spin.setMinimumWidth(85)
+                spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                spin.setStyleSheet(
+                    "QSpinBox { font-weight: bold; padding: 3px 8px; margin: 4px 8px; }"
+                )
+                spin.valueChanged.connect(
+                    lambda val, r=row: self.on_row_copies_changed(r, val)
+                )
+                self.table.setCellWidget(row, self.COL_COPIES, spin)
+
+                # 5. Total Printed Pages for this Invoice
+                total_pages = item.effective_pages_to_print * item.copies
+                sheets_item = QTableWidgetItem(f"{total_pages} Sayfa")
+                sheets_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                sheets_item.setForeground(QColor("#1E293B"))
+                sheets_item.setFont(bold_font)
+                self.table.setItem(row, self.COL_TOTAL_SHEETS, sheets_item)
+
+                # 6. Status
+                status_item = QTableWidgetItem(item.status)
+                status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                status_item.setFont(bold_font)
+                self._style_status_cell(status_item, item.status, item.error_message)
+                self.table.setItem(row, self.COL_STATUS, status_item)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
+            self._updating_table = False
 
     def _style_range_combo(self, cmb: QComboBox, is_all_pages: bool):
         if not is_all_pages:
@@ -1328,13 +1430,26 @@ class MainWindow(QMainWindow):
             cell.setForeground(QColor("#475569"))
             cell.setBackground(QColor("#F8FAFC"))
 
-    def on_table_cell_clicked(self, row: int, _col: int):
+    def _schedule_preview_for_row(self, row: int):
+        if not self.btn_toggle_preview.isChecked():
+            return
         if 0 <= row < len(self.items):
+            self._pending_preview_row = row
+            self.preview_timer.start()
+
+    def _trigger_debounced_preview(self):
+        row = self._pending_preview_row
+        if 0 <= row < len(self.items) and self.btn_toggle_preview.isChecked():
             self.preview_panel.load_invoice_item(self.items[row])
 
+    def on_table_cell_clicked(self, row: int, _col: int):
+        self._schedule_preview_for_row(row)
+
     def on_current_cell_changed(self, current_row: int, _current_col: int, prev_row: int, _prev_col: int):
+        if self._updating_table:
+            return
         if current_row != prev_row and 0 <= current_row < len(self.items):
-            self.preview_panel.load_invoice_item(self.items[current_row])
+            self._schedule_preview_for_row(current_row)
 
     def on_row_range_changed(self, row: int, combo_index: int):
         if 0 <= row < len(self.items):
@@ -1377,39 +1492,51 @@ class MainWindow(QMainWindow):
 
     def set_check_state_by_filter(self, mode: str):
         self._updating_table = True
-        for row, item in enumerate(self.items):
-            if item.page_count <= 0:
-                should_check = False
-            elif mode == "all":
-                should_check = True
-            elif mode == "none":
-                should_check = False
-            elif mode == "single":
-                should_check = item.effective_pages_to_print == 1
-            elif mode == "multi":
-                should_check = item.effective_pages_to_print >= 2
-            else:
-                should_check = item.selected
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            for row, item in enumerate(self.items):
+                if item.page_count <= 0:
+                    should_check = False
+                elif mode == "all":
+                    should_check = True
+                elif mode == "none":
+                    should_check = False
+                elif mode == "single":
+                    should_check = item.effective_pages_to_print == 1
+                elif mode == "multi":
+                    should_check = item.effective_pages_to_print >= 2
+                else:
+                    should_check = item.selected
 
-            item.selected = should_check
-            chk_cell = self.table.item(row, self.COL_SELECT)
-            if chk_cell:
-                chk_cell.setCheckState(
-                    Qt.CheckState.Checked if should_check else Qt.CheckState.Unchecked
-                )
-        self._updating_table = False
+                item.selected = should_check
+                chk_cell = self.table.item(row, self.COL_SELECT)
+                if chk_cell:
+                    chk_cell.setCheckState(
+                        Qt.CheckState.Checked if should_check else Qt.CheckState.Unchecked
+                    )
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
+            self._updating_table = False
         self.update_summary_cards()
 
     def set_copies_for_checked(self, copies: int):
-        for row, item in enumerate(self.items):
-            if item.selected:
-                item.copies = copies
-                spin = self.table.cellWidget(row, self.COL_COPIES)
-                if isinstance(spin, QSpinBox):
-                    spin.blockSignals(True)
-                    spin.setValue(copies)
-                    spin.blockSignals(False)
-                self._update_row_total_sheets_cell(row)
+        self._updating_table = True
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row, item in enumerate(self.items):
+                if item.selected:
+                    item.copies = copies
+                    spin = self.table.cellWidget(row, self.COL_COPIES)
+                    if isinstance(spin, QSpinBox):
+                        spin.blockSignals(True)
+                        spin.setValue(copies)
+                        spin.blockSignals(False)
+                    self._update_row_total_sheets_cell(row)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self._updating_table = False
         self.update_summary_cards()
 
     def update_summary_cards(self):

@@ -1,6 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Optional
+import os
 import re
 import unicodedata
 import pymupdf as fitz  # PyMuPDF
@@ -245,8 +247,12 @@ def scan_folder_for_pdfs(
     default_copies: int = 1,
     smart_skip_redundant_pages: bool = True,
     include_subfolders: bool = True,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[PdfInvoiceItem]:
-    """Scans the given folder for PDF files (including subfolders except 'Yazdırılanlar'), counts pages, and detects redundant 2nd pages."""
+    """
+    Scans the given folder for PDF files (including subfolders except 'Yazdırılanlar'),
+    counts pages, and detects redundant 2nd pages using multi-threaded parallel analysis.
+    """
     folder = Path(folder_path)
     if not folder.exists() or not folder.is_dir():
         return []
@@ -254,24 +260,41 @@ def scan_folder_for_pdfs(
     raw_files: List[Path] = []
 
     if include_subfolders:
-        for p in folder.rglob("*"):
-            if "yazdırılanlar" in [part.lower() for part in p.parts]:
-                continue
-            if p.is_file() and p.suffix.lower() == ".pdf":
-                raw_files.append(p)
+        # Fast os.walk that prunes 'Yazdırılanlar' directories immediately without entering them
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if d.lower() != "yazdırılanlar"]
+            for fname in files:
+                if fname.lower().endswith(".pdf"):
+                    raw_files.append(Path(root) / fname)
     else:
         for p in folder.iterdir():
             if p.is_file() and p.suffix.lower() == ".pdf":
                 raw_files.append(p)
 
     pdf_files = sorted(raw_files, key=lambda x: str(x).lower())
+    total = len(pdf_files)
+    if total == 0:
+        return []
 
-    return [
-        analyze_single_pdf_file(
+    results: List[Optional[PdfInvoiceItem]] = [None] * total
+
+    def _worker(idx_and_path: tuple[int, Path]) -> tuple[int, PdfInvoiceItem]:
+        idx, p = idx_and_path
+        item = analyze_single_pdf_file(
             pdf_path=p,
             base_folder=folder,
             default_copies=default_copies,
             smart_skip_redundant_pages=smart_skip_redundant_pages,
         )
-        for p in pdf_files
-    ]
+        return idx, item
+
+    max_workers = min(8, (os.cpu_count() or 4))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx, item in executor.map(_worker, enumerate(pdf_files)):
+            results[idx] = item
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, item.file_name)
+
+    return [r for r in results if r is not None]
