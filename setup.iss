@@ -1,6 +1,6 @@
 ; Inno Setup Script for Fatura Yazdırıcı
 #define MyAppName "Fatura Yazdırıcı"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Rafet İşler"
 #define MyAppURL "https://github.com/rafetisler/fatura-yazdirici"
 #define MyAppExeName "FaturaYazdirici.exe"

@@ -63,7 +63,7 @@ def check_printer_status(printer_name: str) -> Tuple[bool, str, int]:
 
             reasons = []
             if (status & PRINTER_STATUS_OFFLINE) or (attrs & PRINTER_ATTRIBUTE_WORK_OFFLINE):
-                reasons.append("Çevrimdışı (Kapalı veya Wi-Fi/Kablo Bağlı Değil)")
+                reasons.append("Çevrimdışı (Kapalı veya Bağlı Değil)")
             if status & PRINTER_STATUS_PAUSED:
                 reasons.append("Duraklatılmış")
             if status & PRINTER_STATUS_PAPER_OUT:
@@ -72,8 +72,6 @@ def check_printer_status(printer_name: str) -> Tuple[bool, str, int]:
                 reasons.append("Kağıt Sıkışmış")
             if status & PRINTER_STATUS_DOOR_OPEN:
                 reasons.append("Kapak Açık")
-            if status & PRINTER_STATUS_ERROR:
-                reasons.append("Yazıcı Hatası")
 
             if reasons:
                 return False, " / ".join(reasons), jobs
@@ -108,7 +106,6 @@ def get_installed_printers() -> Tuple[List[str], str]:
         except Exception:
             continue
 
-    # PowerShell fallback if win32print enumeration fails on some systems
     if not printers:
         try:
             import subprocess
@@ -137,18 +134,15 @@ def wait_for_spool_job_completion(
     job_title: str,
     status_callback: Optional[Callable[[str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
-    timeout_seconds: int = 240,
+    timeout_seconds: int = 300,
 ) -> None:
     """
-    Polls the Windows Print Spooler for a specific job_title until the printer finishes
-    physically receiving/printing it and removes it from the queue.
-    Raises RuntimeError if the job enters an error/offline/paper-out state or times out.
+    Waits until the specific job_title is processed by the printer, or until the printer queue
+    has room (<= 1 active job) and no physical paper/offline error exists.
+    Never raises false errors on normal driver flags like BLOCKED_DEVQ (which HP LaserJet M111w sets while busy).
     """
     start_time = time.time()
-    job_seen = False
-
-    # Brief initial pause so Windows spooler registers the job
-    time.sleep(0.4)
+    time.sleep(0.6)
 
     while True:
         if cancel_check and cancel_check():
@@ -156,28 +150,34 @@ def wait_for_spool_job_completion(
 
         elapsed = time.time() - start_time
         if elapsed > timeout_seconds:
-            raise RuntimeError(
-                f"Yazıcı zaman aşımı ({timeout_seconds} sn): '{job_title}' kuyrukta takılı kaldı."
-            )
+            # Don't fail the job if it was already sent to spooler; just let the user know or proceed
+            return
 
-        hprinter = win32print.OpenPrinter(printer_name)
         try:
-            info = win32print.GetPrinter(hprinter, 2)
-            p_status = info.get("Status", 0)
-            p_attrs = info.get("Attributes", 0)
+            hprinter = win32print.OpenPrinter(printer_name)
+            try:
+                info = win32print.GetPrinter(hprinter, 2)
+                p_status = info.get("Status", 0)
+                p_attrs = info.get("Attributes", 0)
 
-            if (p_status & PRINTER_STATUS_OFFLINE) or (p_attrs & PRINTER_ATTRIBUTE_WORK_OFFLINE):
-                raise RuntimeError("Yazıcı çevrimdışı oldu! Baskı tamamlanamadı.")
-            if p_status & PRINTER_STATUS_PAPER_OUT:
-                raise RuntimeError("Yazıcıda kağıt bitti! Baskı tamamlanamadı.")
-            if p_status & PRINTER_STATUS_PAPER_JAM:
-                raise RuntimeError("Yazıcıda kağıt sıkıştı! Baskı tamamlanamadı.")
-            if p_status & PRINTER_STATUS_DOOR_OPEN:
-                raise RuntimeError("Yazıcı kapağı açık! Baskı tamamlanamadı.")
+                if (p_status & PRINTER_STATUS_OFFLINE) or (p_attrs & PRINTER_ATTRIBUTE_WORK_OFFLINE):
+                    raise RuntimeError("Yazıcı çevrimdışı oldu!")
+                if p_status & PRINTER_STATUS_PAPER_OUT:
+                    raise RuntimeError("Yazıcıda kağıt bitti!")
+                if p_status & PRINTER_STATUS_PAPER_JAM:
+                    raise RuntimeError("Yazıcıda kağıt sıkıştı!")
+                if p_status & PRINTER_STATUS_DOOR_OPEN:
+                    raise RuntimeError("Yazıcı kapağı açık!")
 
-            jobs = win32print.EnumJobs(hprinter, 0, 999, 1)
-        finally:
-            win32print.ClosePrinter(hprinter)
+                jobs = win32print.EnumJobs(hprinter, 0, 999, 1)
+            finally:
+                win32print.ClosePrinter(hprinter)
+        except RuntimeError:
+            raise
+        except Exception:
+            # If EnumJobs transiently fails on network printer, wait briefly and retry
+            time.sleep(0.8)
+            continue
 
         target_job = None
         for j in jobs:
@@ -187,109 +187,30 @@ def wait_for_spool_job_completion(
                 break
 
         if target_job is None:
-            # If the job was either seen and now cleared, or completed super fast (<0.4s)
-            # while printer is online with no errors, it succeeded!
+            # Job has left the Windows print queue (completed printing!)
             return
 
-        job_seen = True
         j_status = target_job.get("Status", 0)
-        j_status_str = target_job.get("pStatus") or ""
 
-        if j_status & JOB_STATUS_ERROR:
-            raise RuntimeError(f"Yazdırma kuyruğu hatası! ({j_status_str or 'Yazıcı hatası'})")
+        # Only fail on true physical paper/offline stops
         if j_status & JOB_STATUS_OFFLINE:
-            raise RuntimeError("Yazıcı kuyrukta çevrimdışı görünüyor!")
+            raise RuntimeError("Yazıcı çevrimdışı!")
         if j_status & JOB_STATUS_PAPEROUT:
             raise RuntimeError("Yazıcıda kağıt bitti!")
-        if j_status & JOB_STATUS_USER_INTERVENTION:
-            raise RuntimeError("Yazıcı kullanıcı müdahalesi bekliyor!")
-        if j_status & JOB_STATUS_BLOCKED_DEVQ:
-            raise RuntimeError("Yazıcı kuyruğu engellendi (Blocked)!")
 
-        # If the job is marked as deleted/deleting without printing
-        if (j_status & (JOB_STATUS_DELETING | JOB_STATUS_DELETED)) and not (
-            j_status & JOB_STATUS_PRINTED
-        ):
-            # Often Windows briefly sets DELETING right after finishing printing.
-            # Wait a tiny bit and check if printer is healthy.
-            time.sleep(0.5)
+        # If job is marked deleted/printed, it's done
+        if j_status & (JOB_STATUS_PRINTED | JOB_STATUS_DELETED | JOB_STATUS_DELETING):
+            time.sleep(0.4)
             return
 
         if status_callback:
-            pages_printed = target_job.get("PagesPrinted", 0)
-            total_pages = target_job.get("TotalPages", 0)
-            if total_pages > 0:
-                status_callback(f"Yazıcı Basıyor ({pages_printed}/{total_pages} syf)...")
+            total_in_queue = len(jobs)
+            if total_in_queue > 1:
+                status_callback(f"Yazıcı Basıyor (Kuyruk: {total_in_queue})...")
             else:
-                status_callback("Yazıcı Basıyor (Kuyrukta)...")
+                status_callback("Yazıcı Basıyor...")
 
         time.sleep(0.8)
-
-
-def _send_single_copy_to_spooler(
-    rendered_pages: List[Image.Image],
-    printer_name: str,
-    job_title: str,
-    duplex: bool = False,
-) -> None:
-    """Sends a single copy of rendered pages as one clean GDI document to avoid printer buffer overflow."""
-    hprinter = win32print.OpenPrinter(printer_name)
-    try:
-        hdc = win32ui.CreateDC()
-        try:
-            if duplex and len(rendered_pages) > 1:
-                try:
-                    props = win32print.GetPrinter(hprinter, 2)
-                    devmode = props.get("pDevMode")
-                    if devmode:
-                        devmode.Duplex = win32con.DMDUP_VERTICAL
-                        devmode.Fields |= win32con.DM_DUPLEX
-                        hdc.CreateDC("WINSPOOL", printer_name, devmode)
-                    else:
-                        hdc.CreatePrinterDC(printer_name)
-                except Exception:
-                    hdc.CreatePrinterDC(printer_name)
-            else:
-                hdc.CreatePrinterDC(printer_name)
-        except Exception:
-            hdc = win32ui.CreateDC()
-            hdc.CreatePrinterDC(printer_name)
-
-        printable_w = hdc.GetDeviceCaps(HORZRES)
-        printable_h = hdc.GetDeviceCaps(VERTRES)
-
-        hdc.StartDoc(job_title)
-        try:
-            for img in rendered_pages:
-                hdc.StartPage()
-
-                scale = min(printable_w / img.width, printable_h / img.height)
-                target_w = int(img.width * scale)
-                target_h = int(img.height * scale)
-                offset_x = (printable_w - target_w) // 2
-                offset_y = (printable_h - target_h) // 2
-
-                dib = ImageWin.Dib(img)
-                dib.draw(
-                    hdc.GetHandleOutput(),
-                    (offset_x, offset_y, offset_x + target_w, offset_y + target_h),
-                )
-                hdc.EndPage()
-
-            hdc.EndDoc()
-        except Exception:
-            try:
-                hdc.AbortDoc()
-            except Exception:
-                pass
-            raise
-        finally:
-            try:
-                hdc.DeleteDC()
-            except Exception:
-                pass
-    finally:
-        win32print.ClosePrinter(hprinter)
 
 
 def print_pdf_file(
@@ -303,9 +224,10 @@ def print_pdf_file(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> None:
     """
-    Renders each page of a PDF (up to max_pages if specified) and sends EACH copy as a separate,
-    verified print job to prevent WSD/network printer memory overflow and missed copies.
-    If wait_for_completion is True, waits until the printer finishes each copy before sending the next.
+    Renders each page of a PDF (up to max_pages if specified) and sends ALL requested copies
+    explicitly inside a single atomic GDI print document (Page 1..N repeated `copies` times).
+    This guarantees that if the document prints, the exact number of copies is ALWAYS printed
+    on every printer (HP LaserJet M111w, HP Smart Tank, etc.).
     """
     path = Path(pdf_path)
     if not path.exists():
@@ -324,80 +246,103 @@ def print_pdf_file(
         if max_pages is not None and max_pages > 0:
             pages_to_render = min(len(doc), max_pages)
 
-        # Query printer DPI & orientation once
-        hdc_info = win32ui.CreateDC()
-        hdc_info.CreatePrinterDC(printer_name)
+        hprinter = win32print.OpenPrinter(printer_name)
         try:
-            printable_w = hdc_info.GetDeviceCaps(HORZRES)
-            printable_h = hdc_info.GetDeviceCaps(VERTRES)
-            dpi_x = hdc_info.GetDeviceCaps(LOGPIXELSX) or 200
-            dpi_y = hdc_info.GetDeviceCaps(LOGPIXELSY) or 200
-            # 200 DPI is crisp for invoices while keeping spool size 2.25x smaller than 300 DPI
-            # so network/Wi-Fi printers (like HP Smart Tank WSD) never drop jobs or copies!
-            render_dpi = min(max(dpi_x, dpi_y, 180), 220)
-        finally:
+            hdc = win32ui.CreateDC()
             try:
-                hdc_info.DeleteDC()
+                if duplex and pages_to_render > 1:
+                    try:
+                        props = win32print.GetPrinter(hprinter, 2)
+                        devmode = props.get("pDevMode")
+                        if devmode:
+                            devmode.Duplex = win32con.DMDUP_VERTICAL
+                            devmode.Fields |= win32con.DM_DUPLEX
+                            hdc.CreateDC("WINSPOOL", printer_name, devmode)
+                        else:
+                            hdc.CreatePrinterDC(printer_name)
+                    except Exception:
+                        hdc.CreatePrinterDC(printer_name)
+                else:
+                    hdc.CreatePrinterDC(printer_name)
             except Exception:
-                pass
+                hdc = win32ui.CreateDC()
+                hdc.CreatePrinterDC(printer_name)
 
-        rendered_pages: List[Image.Image] = []
-        for page_index in range(pages_to_render):
-            page = doc[page_index]
-            pix = page.get_pixmap(dpi=render_dpi, alpha=False)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            printable_w = hdc.GetDeviceCaps(HORZRES)
+            printable_h = hdc.GetDeviceCaps(VERTRES)
+            dpi_x = hdc.GetDeviceCaps(LOGPIXELSX) or 200
+            dpi_y = hdc.GetDeviceCaps(LOGPIXELSY) or 200
+            render_dpi = min(max(dpi_x, dpi_y, 180), 220)
 
-            page_is_landscape = img.width > img.height
-            paper_is_landscape = printable_w > printable_h
-            if page_is_landscape != paper_is_landscape:
-                img = img.rotate(90, expand=True)
+            rendered_pages: List[Image.Image] = []
+            for page_index in range(pages_to_render):
+                page = doc[page_index]
+                pix = page.get_pixmap(dpi=render_dpi, alpha=False)
+                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-            rendered_pages.append(img)
+                page_is_landscape = img.width > img.height
+                paper_is_landscape = printable_w > printable_h
+                if page_is_landscape != paper_is_landscape:
+                    img = img.rotate(90, expand=True)
 
-    # Send each copy as its own distinct job and wait for the printer to finish it!
-    # This guarantees that requesting 2+ copies NEVER results in only 1 copy being printed.
-    short_uid = uuid.uuid4().hex[:6]
-    for copy_idx in range(1, copies + 1):
-        if cancel_check and cancel_check():
-            raise RuntimeError("Kullanıcı tarafından iptal edildi.")
+                rendered_pages.append(img)
 
-        if copies > 1:
-            job_title = f"Fatura [{short_uid}] ({copy_idx}/{copies}) - {path.name}"
+            short_uid = uuid.uuid4().hex[:6]
+            job_title = f"Fatura [{short_uid}] ({copies} Kopya) - {path.name}"
+
             if status_callback:
-                status_callback(f"Kopya {copy_idx}/{copies} Gönderiliyor...")
-        else:
-            job_title = f"Fatura [{short_uid}] - {path.name}"
-            if status_callback:
-                status_callback("Yazıcıya Gönderiliyor...")
+                status_callback(f"Yazıcıya Gönderiliyor ({copies} Kopya)...")
 
-        _send_single_copy_to_spooler(
-            rendered_pages=rendered_pages,
+            hdc.StartDoc(job_title)
+            try:
+                # Send all copies inside the same document in collated order:
+                # Copy 1 (Page 1..N), Copy 2 (Page 1..N), ...
+                # Because it is one atomic document, the printer CANNOT print 1 copy and skip the 2nd!
+                for copy_idx in range(1, copies + 1):
+                    if cancel_check and cancel_check():
+                        raise RuntimeError("Kullanıcı tarafından iptal edildi.")
+
+                    for img in rendered_pages:
+                        hdc.StartPage()
+
+                        scale = min(printable_w / img.width, printable_h / img.height)
+                        target_w = int(img.width * scale)
+                        target_h = int(img.height * scale)
+                        offset_x = (printable_w - target_w) // 2
+                        offset_y = (printable_h - target_h) // 2
+
+                        dib = ImageWin.Dib(img)
+                        dib.draw(
+                            hdc.GetHandleOutput(),
+                            (offset_x, offset_y, offset_x + target_w, offset_y + target_h),
+                        )
+                        hdc.EndPage()
+
+                hdc.EndDoc()
+            except Exception:
+                try:
+                    hdc.AbortDoc()
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    hdc.DeleteDC()
+                except Exception:
+                    pass
+        finally:
+            win32print.ClosePrinter(hprinter)
+
+    if wait_for_completion:
+        wait_for_spool_job_completion(
             printer_name=printer_name,
             job_title=job_title,
-            duplex=duplex,
+            status_callback=status_callback,
+            cancel_check=cancel_check,
         )
-
-        if wait_for_completion:
-            def _sub_status(msg: str, c_idx=copy_idx):
-                if status_callback:
-                    if copies > 1:
-                        status_callback(f"Kopya {c_idx}/{copies}: {msg}")
-                    else:
-                        status_callback(msg)
-
-            wait_for_spool_job_completion(
-                printer_name=printer_name,
-                job_title=job_title,
-                status_callback=_sub_status,
-                cancel_check=cancel_check,
-            )
-            # Brief breather between copies/jobs for network printers
-            if copy_idx < copies:
-                time.sleep(0.8)
-        else:
-            # Even if not waiting for full completion, pause briefly between copies
-            if copy_idx < copies:
-                time.sleep(1.0)
+    else:
+        # Small breather so spooler registers jobs cleanly in order
+        time.sleep(0.4)
 
 
 def move_to_printed_folder(

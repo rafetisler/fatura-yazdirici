@@ -1267,9 +1267,10 @@ class MainWindow(QMainWindow):
             spin = QSpinBox()
             spin.setRange(1, 99)
             spin.setValue(item.copies)
+            spin.setMinimumWidth(85)
             spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
             spin.setStyleSheet(
-                "QSpinBox { font-weight: bold; padding: 3px 6px; margin: 4px 10px; }"
+                "QSpinBox { font-weight: bold; padding: 3px 8px; margin: 4px 8px; }"
             )
             spin.valueChanged.connect(
                 lambda val, r=row: self.on_row_copies_changed(r, val)
